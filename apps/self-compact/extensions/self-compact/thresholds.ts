@@ -14,7 +14,7 @@ import { DEFAULT_SPECS, HARD_CAP_FRACTION, type ThresholdSpecs } from "./default
 
 export { DEFAULT_SPECS, HARD_CAP_FRACTION, type ThresholdSpecs };
 
-export type SpecSource = "flag" | "default";
+export type SpecSource = "flag" | "env" | "default";
 
 export interface ThresholdSpecSources {
 	softAt: SpecSource;

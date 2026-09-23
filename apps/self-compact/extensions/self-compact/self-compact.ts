@@ -167,14 +167,29 @@ export default function selfCompact(pi: ExtensionAPI) {
 		return typeof value === "string" && value.trim() !== "" ? value : undefined;
 	};
 
-	/** CLI flag values are applied after extensions load, so settings are read at session start. */
+	/** CLI flag values are applied after extensions load, so settings are read at session start.
+	 * Precedence: CLI flag > environment (SELF_COMPACT_*) > shipped default.
+	 * The env fallback lets containerized deployments pin thresholds for every Pi process, including
+	 * pi-subagents children that are spawned without the parent's CLI flags. */
 	function loadSettings() {
+		const cleanEnv = (name: string): string | undefined => {
+			const value = process.env[name];
+			return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+		};
 		const softFlag = flag("compact-soft-at");
 		const atFlag = flag("compact-at");
 		const bufferFlag = flag("compact-buffer");
-		R.specs = { softAt: softFlag ?? DEFAULT_SPECS.softAt, at: atFlag ?? DEFAULT_SPECS.at, buffer: bufferFlag ?? DEFAULT_SPECS.buffer };
-		R.sources = { softAt: softFlag ? "flag" : "default", at: atFlag ? "flag" : "default", buffer: bufferFlag ? "flag" : "default" };
-		R.fromDefaults = !softFlag && !atFlag && !bufferFlag;
+		const softEnv = cleanEnv("SELF_COMPACT_SOFT_AT");
+		const atEnv = cleanEnv("SELF_COMPACT_AT");
+		const bufferEnv = cleanEnv("SELF_COMPACT_BUFFER");
+		R.specs = {
+			softAt: softFlag ?? softEnv ?? DEFAULT_SPECS.softAt,
+			at: atFlag ?? atEnv ?? DEFAULT_SPECS.at,
+			buffer: bufferFlag ?? bufferEnv ?? DEFAULT_SPECS.buffer,
+		};
+		const source = (f: string | undefined, e: string | undefined): SpecSource => (f ? "flag" : e ? "env" : "default");
+		R.sources = { softAt: source(softFlag, softEnv), at: source(atFlag, atEnv), buffer: source(bufferFlag, bufferEnv) };
+		R.fromDefaults = !softFlag && !atFlag && !bufferFlag && !softEnv && !atEnv && !bufferEnv;
 		R.compactPromptFlag = flag("compact-prompt");
 		R.configError = undefined;
 		try {
