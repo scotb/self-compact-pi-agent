@@ -40,7 +40,7 @@ async function host(t, flags = {}, settings = { compaction: { keepRecentTokens: 
   const ctx = {
     cwd, mode: 'tui', hasUI: true, thinkingLevel: 'off',
     model: { id: 'parity-model', provider: 'fake', contextWindow: 200000, maxTokens: 8192, api: 'openai-completions', reasoning: true },
-    sessionManager: { getBranch: () => entries },
+    sessionManager: { getBranch: () => entries, getEntries: () => entries, getSessionName: () => undefined },
     getContextUsage: () => ({ tokens, contextWindow: ctx.model.contextWindow, percent: tokens / ctx.model.contextWindow * 100 }),
     isIdle: () => true,
     compact: options => compactions.push(options),
@@ -68,7 +68,12 @@ async function host(t, flags = {}, settings = { compaction: { keepRecentTokens: 
     execute: (note = 'NEXT ACTION: continue', signal) => extension.tools.get('self_compact').definition.execute('call', { note_to_self: note }, signal, undefined, ctx),
     view: () => extension.tools.get('view_context').definition.execute('view', {}, undefined, undefined, ctx),
     info: () => extension.commands.get('self-compact-info').handler('', ctx),
-    footer: () => footer({ requestRender() {} }, { fg: (_color, text) => text, bold: text => text }).render(100)[0],
+    footer: () =>
+      footer(
+        { requestRender() {} },
+        { fg: (_color, text) => text, bold: text => text },
+        { getGitBranch: () => null, getExtensionStatuses: () => new Map(), getAvailableProviderCount: () => 1 },
+      ).render(100).join("\n"),
   };
 }
 
@@ -178,10 +183,12 @@ test('P1: Nothing to compact is a failure, never a successful note delivery', as
   assert.equal(h.messages.length, 0);
 });
 
-test('Footer keeps context percentage and useful phases without idle ok', async t => {
+test('Footer keeps built-in layout with the context bar in place of the percentage', async t => {
   const h = await host(t);
-  assert.match(h.footer(), /\] 0%\s*$/);
-  assert.doesNotMatch(h.footer(), /\bok\b/);
+  const fresh = h.footer();
+  assert.match(fresh, /\] 0%/);
+  assert.doesNotMatch(fresh, /\bok\b/);
+  assert.match(fresh, /parity-model • thinking off$/);
   h.usage(45000);
   await h.emit('turn_end');
   assert.match(h.footer(), /NOTICE/);

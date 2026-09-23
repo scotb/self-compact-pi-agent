@@ -17,7 +17,9 @@
  *   returned verbatim as a handoff message (shown in full) that starts the next turn. When Pi would find nothing to
  *   compact (the session fits inside keepRecentTokens) the tool refuses instead of saving a note and locking.
  * - Failure or cancellation keeps the note and the lock; retries, /self-compact-now, reload and /tree recovery.
- * - One-line replacement footer: model id on the left, the 20-cell context bar and phase on the right.
+ * - The custom footer keeps Pi's built-in FooterComponent layout (pwd line; token/cost stats
+ *   left, model right; extension-status line) and replaces only the context-% segment with the
+ *   20-cell context bar, phase tag, and a cycle counter once compactions have occurred.
  *
  * Merged from the claude-fable-5-1 and gpt-6-astra implementations (see specs/self-compact-merge.html).
  */
@@ -30,6 +32,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { formatPct, formatTokens, renderContextBar } from "./context-bar.ts";
+import { computeUsageTotals, footerFormatTokens, formatCwdForFooter, sanitizeStatusText } from "./footer.ts";
 import {
 	FORCED_PROMPT,
 	BUILTIN_PROMPTS,
@@ -644,9 +647,15 @@ export default function selfCompact(pi: ExtensionAPI) {
 		return new Text([theme.fg("accent", theme.bold(title ?? "self-compact info")), ...rest.map((l) => theme.fg("text", l))].join("\n"), 0, 0);
 	});
 
+	/**
+	 * Custom footer: reproduces Pi's built-in FooterComponent layout (reference:
+	 * /opt/pi/packages/coding-agent/src/modes/interactive/components/footer.ts) and replaces
+	 * only the context-% segment (NN.N%/window (auto)) with the self-compact bar, the phase tag,
+	 * and a cycle counter (once at least one compaction has completed in this session).
+	 */
 	function installFooter(ctx: ExtensionContext) {
 		if (ctx.mode !== "tui") return;
-		ctx.ui.setFooter((tui, theme) => {
+		ctx.ui.setFooter((tui, theme, footerData) => {
 			R.requestRender = () => tui.requestRender();
 			return {
 				dispose: () => {
@@ -657,6 +666,20 @@ export default function selfCompact(pi: ExtensionAPI) {
 					const t = R.thresholds;
 					const u = R.usage;
 					const level = R.level;
+
+					// ---- Stats (left): same numbers as the built-in footer ----
+					const totals = computeUsageTotals((ctx.sessionManager.getEntries?.() ?? []) as never[]);
+					const statsParts: string[] = [];
+					if (totals.input) statsParts.push(`↑${footerFormatTokens(totals.input)}`);
+					if (totals.output) statsParts.push(`↓${footerFormatTokens(totals.output)}`);
+					if (totals.cacheRead) statsParts.push(`R${footerFormatTokens(totals.cacheRead)}`);
+					if (totals.cacheWrite) statsParts.push(`W${footerFormatTokens(totals.cacheWrite)}`);
+					if ((totals.cacheRead > 0 || totals.cacheWrite > 0) && totals.cacheHitRate !== null) {
+						statsParts.push(`CH${totals.cacheHitRate.toFixed(1)}%`);
+					}
+					if (totals.cost > 0) statsParts.push(`$${totals.cost.toFixed(3)}`);
+
+					// ---- Context segment: the bar replaces the built-in NN.N%/window display ----
 					const bar = renderContextBar({
 						usedPct: t ? u.percent : null,
 						cachedPct: u.window > 0 ? (u.cachedTokens / u.window) * 100 : 0,
@@ -676,11 +699,66 @@ export default function selfCompact(pi: ExtensionAPI) {
 						.join("");
 					const problem = inert();
 					const tag = statusTag();
-					const left = theme.fg("dim", ` ${ctx.model?.id ?? "no-model"}`) + (R.state.cycle > 0 ? theme.fg("dim", ` · cycle ${R.state.cycle}`) : "");
-					const phase = tag ? ` ${theme.fg(problem ? "error" : locked() ? "error" : levelColor(level), tag)}` : "";
-					const right = `${theme.fg("dim", "[")}${cells}${theme.fg("dim", `] ${bar.label}`)}${phase} `;
-					const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
-					return [truncateToWidth(left + pad + right, width)];
+					const labelColor = level === "forced" ? "error" : level === "warning" ? "warning" : level === "notice" ? "accent" : "dim";
+					const cycle = R.state.cycle > 0 ? theme.fg("dim", ` · cycle ${R.state.cycle}`) : "";
+					const phase = tag ? ` ${theme.fg(problem || locked() ? "error" : levelColor(level), tag)}` : "";
+					statsParts.push(`${theme.fg("dim", "[")}${cells}${theme.fg("dim", "] ")}${theme.fg(labelColor, bar.label)}${cycle}${phase}`);
+
+					let statsLeft = statsParts.join(" ");
+					let statsLeftWidth = visibleWidth(statsLeft);
+					if (statsLeftWidth > width) {
+						statsLeft = truncateToWidth(statsLeft, width, "...");
+						statsLeftWidth = visibleWidth(statsLeft);
+					}
+
+					// ---- Right side: model + thinking level (provider prefix when several providers) ----
+					const minPadding = 2;
+					const modelName = ctx.model?.id || "no-model";
+					let rightSide = modelName;
+					if (ctx.model?.reasoning) {
+						const thinkingLevel = ctx.thinkingLevel || "off";
+						rightSide = thinkingLevel === "off" ? `${modelName} • thinking off` : `${modelName} • ${thinkingLevel}`;
+					}
+					if (footerData?.getAvailableProviderCount?.() > 1 && ctx.model) {
+						const withProvider = `(${ctx.model.provider}) ${rightSide}`;
+						if (statsLeftWidth + minPadding + visibleWidth(withProvider) <= width) rightSide = withProvider;
+					}
+					const rightSideWidth = visibleWidth(rightSide);
+					let statsLine: string;
+					const totalNeeded = statsLeftWidth + minPadding + rightSideWidth;
+					if (totalNeeded <= width) {
+						statsLine = statsLeft + " ".repeat(width - statsLeftWidth - rightSideWidth) + rightSide;
+					} else if (width - statsLeftWidth - minPadding > 0) {
+						const truncatedRight = truncateToWidth(rightSide, width - statsLeftWidth - minPadding, "");
+						statsLine = statsLeft + " ".repeat(Math.max(0, width - statsLeftWidth - visibleWidth(truncatedRight))) + truncatedRight;
+					} else {
+						statsLine = statsLeft;
+					}
+
+					// Dim the stats and the right side separately: the context segment carries its own colors.
+					const dimStatsLeft = theme.fg("dim", statsLeft);
+					const dimRemainder = theme.fg("dim", statsLine.slice(statsLeft.length));
+
+					// ---- pwd line: ~-relative path, git branch, session name ----
+					const home = process.env.HOME || process.env.USERPROFILE;
+					let pwd = formatCwdForFooter(ctx.cwd, home);
+					const branch = footerData?.getGitBranch?.() ?? null;
+					if (branch) pwd = `${pwd} (${branch})`;
+					const sessionName = ctx.sessionManager.getSessionName?.();
+					if (sessionName) pwd = `${pwd} • ${sessionName}`;
+					const lines = [truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "...")), dimStatsLeft + dimRemainder];
+
+					// ---- Extension-status line (other extensions' setStatus output) ----
+					const statuses = footerData?.getExtensionStatuses?.();
+					if (statuses && statuses.size > 0) {
+						const statusLine = Array.from(statuses.entries())
+							.sort(([a], [b]) => a.localeCompare(b))
+							.map(([, text]) => sanitizeStatusText(text))
+							.join(" ");
+						lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
+					}
+
+					return lines;
 				},
 			};
 		});
