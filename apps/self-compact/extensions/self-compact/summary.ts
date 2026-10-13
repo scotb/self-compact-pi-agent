@@ -13,6 +13,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream, type Context } from "@earendil-works/pi-ai";
 import type { LoadedPrompt } from "./prompts.ts";
+import { logEvent, type LogEvent } from "./log.ts";
 
 /**
  * Mirrors Pi's prepareCompaction(): true when a compaction of this branch would have at least one message to
@@ -99,8 +100,8 @@ function replaceInstructions(context: Context, inputs: string[], instructions: s
 	return { messages, truncated };
 }
 
-/** Pi owns split turns, summary updates, file tracking and configured transport retries. */
-export async function generateSummary(event: SessionBeforeCompactEvent, ctx: ExtensionContext, system: LoadedPrompt, instructions: LoadedPrompt) {
+/** Pi owns split turns, summary updates, file tracking and configured transport retries. `log` receives diagnostic events (defaults to the bare logger). */
+export async function generateSummary(event: SessionBeforeCompactEvent, ctx: ExtensionContext, system: LoadedPrompt, instructions: LoadedPrompt, log: (event: LogEvent) => void = logEvent) {
 	if (!ctx.model) throw new Error("No model available for compaction.");
 	const inputs = [
 		historyInput(event.preparation.messagesToSummarize, event.preparation.previousSummary),
@@ -109,25 +110,49 @@ export async function generateSummary(event: SessionBeforeCompactEvent, ctx: Ext
 	].sort((a, b) => b.length - a.length);
 	const userInstructions = summaryInstructions(event, instructions);
 	let truncatedInput = false;
-	const result = await compact(
-		event.preparation, ctx.model, undefined, undefined, event.customInstructions, event.signal, ctx.thinkingLevel,
-		async (model, context, options) => {
-			const maxTokens = Math.min(options?.maxTokens ?? 8192, model.maxTokens || 8192, 8192);
-			const budgetChars = Math.max(8000, (model.contextWindow - maxTokens - 2000) * 4 - system.text.length - userInstructions.length);
-			const { messages, truncated } = replaceInstructions(context, inputs, userInstructions, budgetChars);
-			truncatedInput ||= truncated;
-			const response = await ctx.modelRegistry.complete(model, { ...context, systemPrompt: system.text, messages }, {
-				...options, maxTokens, signal: event.signal, cacheRetention: "none", sessionId: randomUUID(),
-				...(model.api === "openai-completions" && model.reasoning ? { reasoningEffort: "low" as const } : {}),
-			});
-			if (event.signal.aborted || response.stopReason === "aborted") throw new Error("Compaction summary cancelled.");
-			if (response.stopReason !== "error" && !response.content.some(block => block.type === "text" && block.text.trim())) throw new Error("Summary response was empty.");
-			const stream = createAssistantMessageEventStream();
-			stream.end(response);
-			return stream;
-		},
-		undefined, SettingsManager.create(ctx.cwd).getRetrySettings(),
-	);
+	let result: Awaited<ReturnType<typeof compact>>;
+	try {
+		result = await compact(
+			event.preparation, ctx.model, undefined, undefined, event.customInstructions, event.signal, ctx.thinkingLevel,
+			async (model, context, options) => {
+				const maxTokens = Math.min(options?.maxTokens ?? 8192, model.maxTokens || 8192, 8192);
+				const budgetChars = Math.max(8000, (model.contextWindow - maxTokens - 2000) * 4 - system.text.length - userInstructions.length);
+				const { messages, truncated } = replaceInstructions(context, inputs, userInstructions, budgetChars);
+				truncatedInput ||= truncated;
+				log({
+					event: "summary_attempt_start",
+					model: model.id,
+					window: model.contextWindow,
+					maxTokens,
+					budgetChars,
+					inputChars: inputs[0]?.length ?? 0,
+					truncated,
+					hasPrevious: !!event.preparation.previousSummary,
+				});
+				const response = await ctx.modelRegistry.complete(model, { ...context, systemPrompt: system.text, messages }, {
+					...options, maxTokens, signal: event.signal, cacheRetention: "none", sessionId: randomUUID(),
+					...(model.api === "openai-completions" && model.reasoning ? { reasoningEffort: "low" as const } : {}),
+				});
+				if (event.signal.aborted || response.stopReason === "aborted") throw new Error("Compaction summary cancelled.");
+				if (response.stopReason === "error") {
+					// Log the provider's own error text, then pass the response through to the stream: pi's transport
+				// retry only applies to responses carrying the error stopReason (a throw here would bypass it), and
+				// pi's getSummarizationFailure surfaces the same text once retries are exhausted.
+					log({ event: "summary_provider_error", level: "warning", model: model.id, stopReason: response.stopReason, errorMessage: response.errorMessage ?? undefined });
+				} else {
+					if (!response.content.some(block => block.type === "text" && block.text.trim())) throw new Error("Summary response was empty.");
+					log({ event: "summary_attempt_end", ok: true, stopReason: response.stopReason, outputChars: response.content.reduce((n, block) => (block.type === "text" ? n + block.text.length : n), 0) });
+				}
+				const stream = createAssistantMessageEventStream();
+				stream.end(response);
+				return stream;
+			},
+			undefined, SettingsManager.create(ctx.cwd).getRetrySettings(),
+		);
+	} catch (error) {
+		log({ event: "summary_attempt_end", ok: false, where: "compact", error: error instanceof Error ? error.message : String(error) });
+		throw error;
+	}
 	if (event.signal.aborted) throw new Error("Compaction summary cancelled.");
 	return { result, truncatedInput };
 }

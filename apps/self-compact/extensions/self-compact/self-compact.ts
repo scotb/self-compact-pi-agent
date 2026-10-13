@@ -28,6 +28,7 @@ import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { generateSummary, hasCompactionMaterial, keepRecentTokens } from "./summary.ts";
+import { logEvent, type LogEvent } from "./log.ts";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -71,6 +72,8 @@ export const TOOL_NAME = "self_compact";
 export const VIEW_TOOL_NAME = "view_context";
 export { HANDOFF_TYPE, STATE_TYPE };
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
+/** Identifies this Pi process in log entries when the session has no name (sessions here are often unnamed). */
+const RUNTIME_ID = randomUUID();
 const MAX_AUTO_RETRIES = 3;
 const SUMMARY_ATTEMPTS = 2;
 const GUIDANCE_TYPE = "self-compact-guidance";
@@ -101,6 +104,8 @@ interface Runtime {
 	epoch: number;
 	announcedLevel: UsageLevel;
 	compactionInFlight: boolean;
+	/** Set when compaction is issued, cleared on success/failure; used to log duration. */
+	compactionStartedAt?: number;
 	lastCompactionError?: string;
 	retryTimer?: ReturnType<typeof setTimeout>;
 	deliveryTimer?: ReturnType<typeof setTimeout>;
@@ -165,6 +170,33 @@ export default function selfCompact(pi: ExtensionAPI) {
 		promptErrors: new Set(),
 	};
 
+	/** Diagnostic log line: the event plus the session name, so log entries can be correlated per session. Never throws. */
+	const log = (event: LogEvent): void => {
+		try {
+			logEvent({ session: pi.getSessionName() ?? `runtime:${RUNTIME_ID}`, ...event });
+		} catch {
+			logEvent({ ...event, session: `runtime:${RUNTIME_ID}` }); // e.g. getSessionName() throws while the runtime is still loading
+		}
+	};
+
+	/** Guard a hook or callback: log any exception (with a site label and the session envelope) and rethrow. */
+	function guard<A extends unknown[], R>(label: string, fn: (...args: A) => R): (...args: A) => R {
+		return (...args: A): R => {
+			try {
+				return fn(...args);
+			} catch (error) {
+				log({
+					event: "exception",
+					level: "error",
+					where: label,
+					message: error instanceof Error ? error.message : String(error),
+					stack: error instanceof Error ? error.stack : undefined,
+				});
+				throw error;
+			}
+		};
+	}
+
 	const flag = (name: string): string | undefined => {
 		const value = pi.getFlag(name);
 		return typeof value === "string" && value.trim() !== "" ? value : undefined;
@@ -226,7 +258,18 @@ export default function selfCompact(pi: ExtensionAPI) {
 	}
 
 	function save() {
-		pi.appendEntry(STATE_TYPE, structuredClone(R.state));
+		try {
+			pi.appendEntry(STATE_TYPE, structuredClone(R.state));
+		} catch (error) {
+			log({
+				event: "persist_failed",
+				level: "error",
+				where: "save",
+				message: error instanceof Error ? error.message : String(error),
+				stack: error instanceof Error ? error.stack : undefined,
+			});
+			throw error;
+		}
 	}
 
 	/** Every deferred callback belongs to one session epoch; a new session, tree switch, or shutdown cancels them all. */
@@ -244,13 +287,14 @@ export default function selfCompact(pi: ExtensionAPI) {
 		R[key] = setTimeout(() => {
 			R[key] = undefined;
 			if (!R.alive || epoch !== R.epoch) return;
-			fn();
+			guard(`timer:${key}`, fn)();
 		}, delayMs);
 	}
 
 	function setLocked(value: boolean) {
 		if (R.state.locked === value) return;
 		R.state.locked = value;
+		log({ event: "lock_change", locked: value, level: R.level, tokens: R.usage.tokens, percent: R.usage.percent, handoff: handoff()?.status });
 	}
 
 	function resolve(ctx: ExtensionContext) {
@@ -345,6 +389,15 @@ export default function selfCompact(pi: ExtensionAPI) {
 		}
 		if (LEVEL_ORDER[level] > LEVEL_ORDER[R.announcedLevel]) {
 			R.announcedLevel = level;
+			log({
+				event: "threshold_crossing",
+				level,
+				tokens: R.usage.tokens,
+				percent: R.usage.percent,
+				softTokens: R.thresholds?.softTokens,
+				warnTokens: R.thresholds?.warnTokens,
+				forcedTokens: R.thresholds?.forcedTokens,
+			});
 			// The crossing entry carries the full guidance message the model will receive, shown once in the TUI.
 			let text: string | undefined;
 			try { text = renderGuidance(level); }
@@ -371,42 +424,59 @@ export default function selfCompact(pi: ExtensionAPI) {
 	}
 
 	function deliverHandoff(ctx: ExtensionContext) {
-		const h = handoff();
-		if (!R.alive || !h || h.status !== "ready") return;
-		if (!ctx.isIdle()) {
-			if (!R.deliveryTimer) {
-				const epoch = R.epoch;
-				R.deliveryTimer = setTimeout(() => {
-					R.deliveryTimer = undefined;
-					if (epoch === R.epoch) deliverHandoff(ctx);
-				}, 25);
+		guard("deliverHandoff", () => {
+			const h = handoff();
+			if (!R.alive || !h || h.status !== "ready") return;
+			if (!ctx.isIdle()) {
+				if (!R.deliveryTimer) {
+					const epoch = R.epoch;
+					R.deliveryTimer = setTimeout(() => {
+						R.deliveryTimer = undefined;
+						if (epoch === R.epoch) deliverHandoff(ctx);
+					}, 25);
+				}
+				return;
 			}
-			return;
-		}
-		// Content is exactly the saved note (verbatim contract); the header lives in the renderer and details.
-		pi.sendMessage({ customType: HANDOFF_TYPE, content: h.note, display: true, details: { id: h.id, cycle: R.state.cycle, note: h.note } }, { triggerTurn: true });
+			// Content is exactly the saved note (verbatim contract); the header lives in the renderer and details.
+			log({ event: "handoff_delivered", handoffId: h.id, noteChars: h.note.length, cycle: R.state.cycle });
+			pi.sendMessage({ customType: HANDOFF_TYPE, content: h.note, display: true, details: { id: h.id, cycle: R.state.cycle, note: h.note } }, { triggerTurn: true });
+		})();
 	}
 
 	function startCompaction(ctx: ExtensionContext, trigger: string) {
-		const h = handoff();
-		if (R.compactionInFlight || !h || (h.status !== "pending" && h.status !== "failed")) return;
-		R.compactionInFlight = true;
-		h.status = "compacting";
-		save();
-		notify(ctx, `self-compact: compacting (${trigger}, note ${h.note.length} chars)…`, "info");
-		refreshUi(ctx);
-		ctx.compact({
-			onComplete: () => {
-				R.compactionInFlight = false;
-			},
-			onError: () => {
-				R.compactionInFlight = false;
-			},
-		});
+		guard("startCompaction", () => {
+			const h = handoff();
+			if (R.compactionInFlight || !h || (h.status !== "pending" && h.status !== "failed")) return;
+			R.compactionInFlight = true;
+			h.status = "compacting";
+			R.compactionStartedAt = Date.now();
+			save();
+			notify(ctx, `self-compact: compacting (${trigger}, note ${h.note.length} chars)…`, "info");
+			refreshUi(ctx);
+			log({
+				event: "compact_start",
+				trigger,
+				handoffId: h.id,
+				noteChars: h.note.length,
+				attempts: h.attempts,
+				tokens: R.usage.tokens,
+				percent: R.usage.percent,
+				level: R.level,
+			});
+			ctx.compact({
+				onComplete: () => {
+					R.compactionInFlight = false;
+				},
+				onError: () => {
+					R.compactionInFlight = false;
+				},
+			});
+		})();
 	}
 
 	function scheduleRetry(ctx: ExtensionContext) {
 		const delay = 2_000 * Math.max(1, handoff()?.attempts ?? 1);
+		log({ event: "retry_scheduled", delayMs: delay, attempt: (handoff()?.attempts ?? 0) + 1, handoffId: handoff()?.id, lastError: R.lastCompactionError });
 		deferInEpoch("retryTimer", delay, () => {
 			if (handoff()?.status === "failed" && ctx.isIdle()) startCompaction(ctx, `auto-retry ${(handoff()?.attempts ?? 0) + 1}`);
 		});
@@ -511,6 +581,7 @@ export default function selfCompact(pi: ExtensionAPI) {
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const view = contextView(ctx);
 			refreshUi(ctx);
+			log({ event: "view_context_call", tokens: view.used_tokens, percent: view.used_percent, level: view.level, locked: view.tools_locked });
 			return { content: [{ type: "text", text: JSON.stringify(view, null, 2) }], details: view };
 		},
 		renderCall(_args, theme) {
@@ -562,6 +633,16 @@ export default function selfCompact(pi: ExtensionAPI) {
 			save();
 			refreshUi(ctx);
 			notify(ctx, `self-compact: note saved (${note.length} chars). Compaction runs when this turn ends.`, "info");
+			log({
+				event: "self_compact_call",
+				handoffId: R.state.handoff.id,
+				noteChars: note.length,
+				cycle: R.state.cycle + 1,
+				attempt: R.state.handoff.attempts,
+				tokens: R.usage.tokens,
+				percent: R.usage.percent,
+				level: R.level,
+			});
 			const at = R.usage.tokens === null ? "unknown usage" : `${R.usage.tokens.toLocaleString("en-US")} tokens (${formatPct(R.usage.percent, 1)}), level ${R.level}`;
 			return {
 				content: [{ type: "text", text: `Note saved (${note.length} chars) at ${at}. Every other tool is blocked until compaction succeeds. Stop now: compaction runs when this turn ends and your note will be returned verbatim.` }],
@@ -821,28 +902,41 @@ export default function selfCompact(pi: ExtensionAPI) {
 		}
 		installFooter(ctx);
 		trackLevel(ctx);
+		log({
+			event: "session_start",
+			reason: event.reason ?? "start",
+			cycle: R.state.cycle,
+			locked: R.state.locked,
+			handoff: handoff()?.status,
+			tokens: R.usage.tokens,
+			percent: R.usage.percent,
+			resolved: R.thresholds !== undefined,
+			resolveError: R.resolveError,
+			configError: R.configError,
+		});
 	};
 
-	pi.on("session_start", recover);
-	pi.on("session_tree", async (_event, ctx) => recover({ reason: "tree" }, ctx));
+	pi.on("session_start", guard("session_start", recover));
+	pi.on("session_tree", guard("session_tree", async (_event, ctx) => recover({ reason: "tree" }, ctx)));
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", guard("session_shutdown", async () => {
 		R.alive = false;
 		R.epoch += 1;
 		clearTimers();
-	});
+		log({ event: "session_shutdown", compactionInFlight: R.compactionInFlight, locked: R.state.locked, handoff: handoff()?.status });
+	}));
 
-	pi.on("model_select", async (_event, ctx) => {
+	pi.on("model_select", guard("model_select", async (_event, ctx) => {
 		resolve(ctx);
 		trackLevel(ctx);
-	});
+	}));
 
-	pi.on("before_agent_start", async (event, ctx) => {
+	pi.on("before_agent_start", guard("before_agent_start", async (event, ctx) => {
 		trackLevel(ctx);
 		return { systemPrompt: event.systemPrompt + SYSTEM_PROMPT_LINE };
-	});
+	}));
 
-	pi.on("context", async (event, ctx) => {
+	pi.on("context", guard("context", async (event, ctx) => {
 		trackLevel(ctx);
 		const messages = event.messages.filter(message => !(message.role === "custom" && message.customType === GUIDANCE_TYPE));
 		try {
@@ -857,9 +951,9 @@ export default function selfCompact(pi: ExtensionAPI) {
 			if (R.level === "warning") messages.push(guidanceMessage(renderTemplate(BUILTIN_PROMPTS.warning, templateValues())));
 		}
 		return { messages };
-	});
+	}));
 
-	pi.on("message_end", async (event, ctx) => {
+	pi.on("message_end", guard("message_end", async (event, ctx) => {
 		if (event.message.role === "assistant") {
 			trackLevel(ctx);
 			return;
@@ -875,9 +969,9 @@ export default function selfCompact(pi: ExtensionAPI) {
 				refreshUi(ctx);
 			}
 		}
-	});
+	}));
 
-	pi.on("tool_call", async (event, ctx) => {
+	pi.on("tool_call", guard("tool_call", async (event, ctx) => {
 		trackLevel(ctx);
 		const problem = inert();
 		if (problem) return { block: true, reason: `self-compact rejected its settings, so this session is not protected: ${problem}. Fix the --compact-* flags and restart.` };
@@ -912,21 +1006,21 @@ export default function selfCompact(pi: ExtensionAPI) {
 			};
 		}
 		return undefined;
-	});
+	}));
 
-	pi.on("turn_end", async (_event, ctx) => {
+	pi.on("turn_end", guard("turn_end", async (_event, ctx) => {
 		trackLevel(ctx);
-	});
+	}));
 
-	pi.on("agent_end", async (_event, ctx) => {
+	pi.on("agent_end", guard("agent_end", async (_event, ctx) => {
 		trackLevel(ctx);
 		if (inert() || activeHandoff() || R.idleRequestEpoch === R.epoch) return;
 		if (!locked() && R.level !== "warning" && R.level !== "forced") return;
 		R.idleRequestEpoch = R.epoch;
 		pi.sendMessage({ customType: GUIDANCE_TYPE, content: nowPrompt(), display: false }, { triggerTurn: true, deliverAs: "followUp" });
-	});
+	}));
 
-	pi.on("agent_settled", async (_event, ctx) => {
+	pi.on("agent_settled", guard("agent_settled", async (_event, ctx) => {
 		if (!R.alive) return; // shutdown during compaction: the ctx is already stale
 		refreshUi(ctx);
 		if (inert()) return;
@@ -934,9 +1028,9 @@ export default function selfCompact(pi: ExtensionAPI) {
 		if (!h || !ctx.isIdle()) return;
 		if (h.status === "ready") deliverHandoff(ctx);
 		else if (h.status === "pending" || (h.status === "failed" && h.attempts < MAX_AUTO_RETRIES && R.lastCompactionError)) startCompaction(ctx, h.status === "pending" ? "agent idle" : "retry after failure");
-	});
+	}));
 
-	pi.on("session_before_compact", async (event, ctx) => {
+	pi.on("session_before_compact", guard("session_before_compact", async (event, ctx) => {
 		if (event.reason !== "manual") {
 			setLocked(true);
 			save();
@@ -961,7 +1055,7 @@ export default function selfCompact(pi: ExtensionAPI) {
 			if (signal.aborted) return { cancel: true };
 			try {
 				const instructions = loadPromptFile("summaryInstructions", R.searchDirs);
-				const { result, truncatedInput } = await generateSummary(event, ctx, prompt, instructions);
+				const { result, truncatedInput } = await generateSummary(event, ctx, prompt, instructions, log);
 				return {
 					compaction: {
 						...result,
@@ -978,11 +1072,12 @@ export default function selfCompact(pi: ExtensionAPI) {
 			}
 		}
 		R.lastCompactionError = `Summary generation failed after ${SUMMARY_ATTEMPTS} attempts: ${lastError}`;
+		log({ event: "compact_failed", level: "error", where: "summary_generation", attempts: SUMMARY_ATTEMPTS, error: R.lastCompactionError });
 		notify(ctx, `self-compact: ${R.lastCompactionError}`, "error");
 		return { cancel: true };
-	});
+	}));
 
-	pi.on("session_compact", async (event, ctx) => {
+	pi.on("session_compact", guard("session_compact", async (event, ctx) => {
 		R.epoch += 1;
 		R.announcedLevel = "idle";
 		R.compactionInFlight = false;
@@ -1000,9 +1095,21 @@ export default function selfCompact(pi: ExtensionAPI) {
 			save();
 		}
 		refreshUi(ctx);
-	});
+		log({
+			event: "compact_success",
+			reason: event.reason,
+			fromExtension: event.fromExtension,
+			cycle: R.state.cycle,
+			durationMs: R.compactionStartedAt !== undefined ? Date.now() - R.compactionStartedAt : undefined,
+			tokensBefore: event.compactionEntry.tokensBefore,
+			tokensAfter: R.usage.tokens,
+			percentAfter: R.usage.percent,
+			handoff: handoff()?.status,
+		});
+		R.compactionStartedAt = undefined;
+	}));
 
-	pi.on("session_compact_failed", async (event, ctx) => {
+	pi.on("session_compact_failed", guard("session_compact_failed", async (event, ctx) => {
 		// We intentionally defer native auto-compaction until our idle handoff transaction.
 		if (event.reason !== "manual" && event.aborted) return;
 		R.compactionInFlight = false;
@@ -1018,6 +1125,19 @@ export default function selfCompact(pi: ExtensionAPI) {
 		save();
 		refreshUi(ctx);
 		const current = handoff()!;
+		log({
+			event: "compact_failed",
+			level: "error",
+			reason: event.reason,
+			aborted: event.aborted,
+			fromExtension: event.fromExtension,
+			errorMessage: event.errorMessage,
+			ourError: R.lastCompactionError,
+			handoff: current.status,
+			attempts: current.attempts,
+			durationMs: R.compactionStartedAt !== undefined ? Date.now() - R.compactionStartedAt : undefined,
+		});
+		R.compactionStartedAt = undefined;
 		const canRetry = (ours || !event.aborted) && current.attempts < MAX_AUTO_RETRIES;
 		if (canRetry) {
 			notify(ctx, `self-compact: compaction failed (attempt ${current.attempts}): ${current.error}. Note kept, tools stay locked, retrying automatically.`, "warning");
@@ -1025,5 +1145,5 @@ export default function selfCompact(pi: ExtensionAPI) {
 		} else {
 			notify(ctx, `self-compact: compaction ${event.aborted && !ours ? "cancelled" : "failed"} (attempt ${current.attempts}): ${current.error}. Note kept and tools stay locked. Run /self-compact-now or /compact to retry.`, "error");
 		}
-	});
+	}));
 }
