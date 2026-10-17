@@ -31,9 +31,13 @@ export class RpcClient {
 	constructor(options: RpcClientOptions) {
 		this.options = options;
 		if (options.logFile) mkdirSync(dirname(options.logFile), { recursive: true });
+		// Hermetic environment: drop SELF_COMPACT_* inherited from the host (e.g. the pi-docker
+		// container sets SELF_COMPACT_AT=70%); tests set only what they need via options.env.
+		const env: NodeJS.ProcessEnv = { ...process.env, PI_SKIP_VERSION_CHECK: "1", PI_OFFLINE: "1" };
+		for (const key of Object.keys(env)) if (key.startsWith("SELF_COMPACT_")) delete env[key];
 		this.proc = spawn("pi", ["--mode", "rpc", ...options.args], {
 			cwd: options.cwd,
-			env: { ...process.env, PI_SKIP_VERSION_CHECK: "1", PI_OFFLINE: "1", ...options.env },
+			env: { ...env, ...options.env },
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		this.proc.stdout.setEncoding("utf8");

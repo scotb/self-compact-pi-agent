@@ -211,17 +211,23 @@ function streamScripted(model: Model<any>, context: Context, options?: SimpleStr
 		stopReason: "pending",
 		timestamp: Date.now(),
 	};
-	const isSummary = !context.tools || context.tools.length === 0;
+	// Pi >= 1.2 folds systemPrompt and tools into a leading system message; the provider
+	// context is { messages } only. A summary request is recognized by its conversation
+	// prompt text (the shapes pi's compaction.js emits), not by a missing tools array.
+	const systemPrompt = context.messages[0]?.role === "system" ? textOf((context.messages[0] as { content?: unknown }).content) : "";
+	const firstUser = context.messages.find((m) => m.role === "user");
+	const firstUserText = firstUser ? textOf((firstUser as { content?: unknown }).content) : "";
+	const isSummary = /^<conversation>/.test(firstUserText) || /^# Conversation\n/.test(firstUserText);
 	setTimeout(() => {
 		try {
 			stream.push({ type: "start", partial: output });
 			if (isSummary) {
 				summaryCalls += 1;
-				trace({ kind: "summary", call: summaryCalls, systemPrompt: context.systemPrompt?.slice(0, 200) });
+				trace({ kind: "summary", call: summaryCalls, systemPrompt: systemPrompt.slice(0, 200) });
 				if (summaryCalls <= SUMMARY_FAIL) {
 					throw new Error(`fake summary failure #${summaryCalls}`);
 				}
-				const text = `FAKE-SUMMARY[${(context.systemPrompt ?? "").slice(0, 60)}]\n## Goal\nScripted goal.\n## Next Steps\n1. Follow the note.`;
+				const text = `FAKE-SUMMARY[${systemPrompt.slice(0, 60)}]\n## Goal\nScripted goal.\n## Next Steps\n1. Follow the note.`;
 				output.content.push({ type: "text", text: "" });
 				stream.push({ type: "text_start", contentIndex: 0, partial: output });
 				(output.content[0] as { text: string }).text = text;
