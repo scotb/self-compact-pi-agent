@@ -16,6 +16,14 @@ import type { LoadedPrompt } from "./prompts.ts";
 import { logEvent, type LogEvent } from "./log.ts";
 
 /**
+ * Hard cap on summary output tokens. Raising it gives the (reasoning) model more room to finish a
+ * summary before hitting stopReason "length"; the trade is a smaller summary input budget —
+ * budgetChars = (window - maxTokens - 2000) * 4 minus prompt lengths — which still leaves ~4x
+ * headroom over typical inputs at the 85-90% compaction point of a 131k window.
+ */
+const SUMMARY_MAX_TOKENS = 16384;
+
+/**
  * Mirrors Pi's prepareCompaction(): true when a compaction of this branch would have at least one message to
  * summarize, false when Pi would fail with "Nothing to compact" (everything fits inside keepRecentTokens, or the
  * last entry is already a compaction).
@@ -115,7 +123,7 @@ export async function generateSummary(event: SessionBeforeCompactEvent, ctx: Ext
 		result = await compact(
 			event.preparation, ctx.model, undefined, undefined, event.customInstructions, event.signal, ctx.thinkingLevel,
 			async (model, context, options) => {
-				const maxTokens = Math.min(options?.maxTokens ?? 8192, model.maxTokens || 8192, 8192);
+				const maxTokens = Math.min(options?.maxTokens ?? SUMMARY_MAX_TOKENS, model.maxTokens || SUMMARY_MAX_TOKENS, SUMMARY_MAX_TOKENS);
 				const budgetChars = Math.max(8000, (model.contextWindow - maxTokens - 2000) * 4 - system.text.length - userInstructions.length);
 				const { messages, truncated } = replaceInstructions(context, inputs, userInstructions, budgetChars);
 				truncatedInput ||= truncated;
