@@ -311,6 +311,7 @@ export default function selfCompact(pi: ExtensionAPI) {
 
 	function snapshotUsage(ctx: ExtensionContext): UsageSnapshot {
 		const usage = ctx.getContextUsage();
+		log({ event: "debug-sc-raw", raw: usage ?? null, modelWindow: ctx.model?.contextWindow ?? null });
 		const window = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
 		const tokens = usage?.tokens ?? null;
 		const percent = usage?.percent ?? (tokens !== null && window > 0 ? (tokens / window) * 100 : null);
@@ -351,6 +352,7 @@ export default function selfCompact(pi: ExtensionAPI) {
 		const u = R.usage;
 		if (!t) return "[--------------------] --%";
 		const cachedPct = u.window > 0 ? (u.cachedTokens / u.window) * 100 : 0;
+		log({ event: "debug-sc-bar", usedPct: u.percent, cachedPct, tokens: u.tokens, window: u.window });
 		return renderContextBar({ usedPct: u.percent, cachedPct, softPct: t.softPct, warnPct: t.warnPct, forcedPct: t.forcedPct }).text;
 	}
 
@@ -365,6 +367,7 @@ export default function selfCompact(pi: ExtensionAPI) {
 	function refreshUi(ctx: ExtensionContext) {
 		R.usage = snapshotUsage(ctx);
 		R.level = R.thresholds ? levelFor(R.usage.tokens, R.thresholds) : "unknown";
+		log({ event: "debug-sc-refresh", tokens: R.usage.tokens, percent: R.usage.percent, level: R.level });
 		if (ctx.mode === "tui") R.requestRender?.();
 		else if (ctx.hasUI) ctx.ui.setStatus("self-compact", [contextBarText(), statusTag()].filter(Boolean).join(" "));
 	}
