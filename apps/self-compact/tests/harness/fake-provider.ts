@@ -109,7 +109,7 @@ function decide(context: Context): Plan {
 	// Transient guidance arrives as a trailing user-role message; look past it for the real last message.
 	let lastIndex = messages.length - 1;
 	let guidance = "";
-	if (lastIndex >= 0 && messages[lastIndex]!.role === "user" && /^\[self-compact · (notice|WARNING|FORCED)\]/.test(textOf((messages[lastIndex] as { content?: unknown }).content))) {
+	if (lastIndex >= 0 && messages[lastIndex]!.role === "user" && /^\[self-compact · (notice|WARNING|FORCED|post-compaction)\]/.test(textOf((messages[lastIndex] as { content?: unknown }).content))) {
 		guidance = textOf((messages[lastIndex] as { content?: unknown }).content);
 		lastIndex -= 1;
 	}

@@ -122,7 +122,15 @@ test("lifecycle: thresholds, lock, self_compact, compaction, verbatim note, cont
 		assert.ok(events.indexOf(writes[0]!) > events.indexOf(handoffEvent));
 		assert.equal(readFileSync(join(t.dir, "result.txt"), "utf8").trim(), "done");
 
-		// 7. The state ledger and the final info line.
+		// 7. Post-compaction baseline: exactly one turn carries the fresh-usage notice, and it is
+		// the first model turn after the self_compact call (one-shot; the normal guidance channel is idle).
+		const compactTurn = turns.findIndex((r) => r.plan?.toolCall?.name === "self_compact");
+		const baselineTurns = turns.filter((r) => /^\[self-compact · post-compaction\]/.test(r.lastText ?? ""));
+		assert.equal(baselineTurns.length, 1, "the post-compaction baseline notice is one-shot");
+		assert.match(baselineTurns[0]!.lastText ?? "", /Fresh numbers: context is now/, "baseline carries fresh usage");
+		assert.ok(compactTurn >= 0 && turns.indexOf(baselineTurns[0]!) > compactTurn, "baseline arrives on a turn after self_compact");
+
+		// 8. The state ledger and the final info line.
 		const statuses = entries(events, "self-compact-state").map((s) => (s.data.handoff as { status?: string } | undefined)?.status).filter(Boolean);
 		assert.deepEqual(statuses, ["pending", "compacting", "ready", "done"]);
 		const since = client.mark();
@@ -180,6 +188,8 @@ test("two cycles: guidance and the forced lock re-arm after a completed handoff"
 		assert.equal(blocked.length, 2, "the forced lock engaged in both cycles");
 		assert.equal(toolEnds(events, "self_compact").filter((e) => e.isError === false).length, 2);
 		assert.equal(eventsOfType(events, "compaction_end").filter((e) => e.aborted === false).length, 2);
+		const baselineCount = trace(t.traceFile).filter((r) => r.kind === "turn" && /^\[self-compact · post-compaction\]/.test(r.lastText ?? "")).length;
+		assert.equal(baselineCount, 2, "each compaction re-anchors the baseline exactly once");
 		const ids = handoffMessages(events).map((e) => (e.message as { details?: { id?: string; cycle?: number } }).details);
 		assert.equal(ids.length, 2);
 		assert.notEqual(ids[0]?.id, ids[1]?.id, "each cycle has its own durable handoff id");

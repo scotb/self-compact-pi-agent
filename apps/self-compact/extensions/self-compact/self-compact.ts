@@ -10,6 +10,9 @@
  *   (the `context` hook); it is never persisted into the model's context. Each threshold crossing shows the full
  *   guidance message once in the TUI. The transcript otherwise only shows the user's prompts and the returned note.
  * - `view_context()` returns used tokens, percent, level, and the thresholds as JSON, since the model cannot see the footer.
+ * - After every successful compaction the first LLM call carries a one-shot transient
+ *   `[self-compact · post-compaction]` notice with fresh usage, re-anchoring the model's
+ *   baseline numbers (the verbatim handoff note cannot carry them).
  * - At the forced threshold every tool except `self_compact` and `view_context` is blocked in `tool_call` with an
  *   explicit reason (the active tool list is never narrowed: Pi would answer "Tool X not found" before the hook).
  * - `self_compact({ note_to_self })` saves the note, ends the run, compaction runs once the agent is idle with the
@@ -103,6 +106,8 @@ interface Runtime {
 	/** Context epoch: bumps on every compaction and session start so per-epoch guidance re-arms. */
 	epoch: number;
 	announcedLevel: UsageLevel;
+	/** One-shot: on the first LLM call after a successful compaction, deliver a fresh-usage baseline notice. */
+	baselinePending: boolean;
 	compactionInFlight: boolean;
 	/** Set when compaction is issued, cleared on success/failure; used to log duration. */
 	compactionStartedAt?: number;
@@ -164,6 +169,7 @@ export default function selfCompact(pi: ExtensionAPI) {
 		state: emptyState(),
 		epoch: 0,
 		announcedLevel: "idle",
+		baselinePending: false,
 		compactionInFlight: false,
 		alive: true,
 		idleRequestEpoch: -1,
@@ -424,6 +430,20 @@ export default function selfCompact(pi: ExtensionAPI) {
 		if (level === "unknown" || level === "idle") return undefined;
 		if (!compactable(ctx)) return undefined;
 		return renderGuidance(level);
+	}
+
+	/** One-shot fresh-usage notice for the first LLM call after a successful compaction.
+	 * Without it the model's last known numbers are the pre-compaction ones (the self_compact
+	 * tool result), so its internal estimate would start from a stale baseline. */
+	function baselineNotice(ctx: ExtensionContext): string | undefined {
+		if (!R.baselinePending) return undefined;
+		const u = R.usage;
+		if (u.tokens === null) return undefined; // usage unknown (no API response yet): keep pending, deliver on the next call
+		R.baselinePending = false;
+		let text = `[self-compact · post-compaction] Fresh numbers: context is now ${u.tokens.toLocaleString("en-US")} tokens (${formatPct(u.percent, 1)}) of ${u.window.toLocaleString("en-US")}. Your pre-compaction numbers are stale — discard them.`;
+		const t = R.thresholds;
+		if (t) text += ` Warning line ${t.warnTokens.toLocaleString("en-US")} (${formatPct(t.warnPct, 1)}%), hard cutoff ${t.forcedTokens.toLocaleString("en-US")} (${formatPct(t.forcedPct, 1)}%).`;
+		return text;
 	}
 
 	function deliverHandoff(ctx: ExtensionContext) {
@@ -953,6 +973,10 @@ export default function selfCompact(pi: ExtensionAPI) {
 			}
 			if (R.level === "warning") messages.push(guidanceMessage(renderTemplate(BUILTIN_PROMPTS.warning, templateValues())));
 		}
+		// One-shot post-compaction baseline: delivered even when the level is idle (the normal
+		// guidance channel is silent at idle), so the model never starts from stale numbers.
+		const baseline = baselineNotice(ctx);
+		if (baseline) messages.push(guidanceMessage(baseline));
 		return { messages };
 	}));
 
@@ -1084,6 +1108,7 @@ export default function selfCompact(pi: ExtensionAPI) {
 		R.epoch += 1;
 		R.announcedLevel = "idle";
 		R.compactionInFlight = false;
+		R.baselinePending = true; // re-anchor the model's baseline on the next LLM call
 		const h = handoff();
 		if (h && h.status !== "done") {
 			R.state.cycle += 1;
